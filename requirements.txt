@@ -5,3 +5,7 @@ pandas
 scikit-learn
 torch
 streamlit
+gTTS
+requests
+aiohttp
+pytest

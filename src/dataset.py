@@ -1,7 +1,7 @@
 """
-================================================================================
- dataset.py - NAP DU LIEU KEYPOINT CHO MODEL (buoc 2)
-================================================================================
+===============================================================================
+  dataset.py - NAP DU LIEU KEYPOINT CHO MODEL (buoc 2)
+===============================================================================
 
 MUC DICH
 --------
@@ -13,7 +13,7 @@ KHAI NIEM:
     - Dataset   : "kho" du lieu, lay tung mau theo chi so.
     - DataLoader: (o train.py) gom nhieu mau thanh 1 "batch" de train nhanh.
     - collate_fn: cach gom 1 batch khi cac video DAI NGAN KHAC NHAU (phai padding).
-================================================================================
+===============================================================================
 """
 from pathlib import Path
 
@@ -37,9 +37,9 @@ class VSLDataset(Dataset):
         self.processed_dir = Path(processed_dir)  # noi chua .npy
         self.max_len = max_len                    # cat video qua dai
         self.feature_mode = feature_mode
+        self._feature_dim = None                  # cache sau lan dau tien
 
     def __len__(self):
-        # PyTorch goi ham nay de biet tong so mau
         return len(self.df)
 
     def _load_npy(self, filename):
@@ -56,10 +56,16 @@ class VSLDataset(Dataset):
         # "Duoi phang" (T, diem, 3) -> (T, diem*3) de dua vao mang
         return arr.reshape(arr.shape[0], -1).astype(np.float32)
 
+    def _compute_feature_dim(self):
+        first = self._load_npy(self.df.iloc[0]["filename"])
+        return first.shape[1]
+
     @property
     def feature_dim(self):
         """So chieu dac trung moi frame (model can de biet kich thuoc dau vao)."""
-        return self._load_npy(self.df.iloc[0]["filename"]).shape[1]
+        if self._feature_dim is None:
+            self._feature_dim = self._compute_feature_dim()
+        return self._feature_dim
 
     def __getitem__(self, idx):
         """Tra 1 mau: (chuoi keypoint, do dai that, nhan dang so)."""
