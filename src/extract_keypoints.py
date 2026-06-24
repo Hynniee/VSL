@@ -1,181 +1,170 @@
 """
-================================================================================
- extract_keypoints.py - TRICH KEYPOINT TU VIDEO (buoc 1 cua pipeline)
-================================================================================
-
-MUC DICH
---------
-Doc cac video ky hieu (.mp4), dung MediaPipe Holistic de lay toa do cac diem
-tren co the (tay/mat/than) o TUNG frame, roi luu thanh mang so (.npy) de model
-hoc. Day la buoc bien "hinh anh" -> "so".
-
-LUONG:
-    data/raw_words/<nhan>/*.mp4  ->  data/processed/<ten>.npy
-                                 ->  data/metadata.csv  (1 dong / video)
-                                 ->  data/labels.json   (nhan -> so)
-
-CACH CHAY:
-    python src/extract_keypoints.py --raw data/raw_words
-    python src/extract_keypoints.py --raw data/raw_alphabet --label-map data/label_map.json
-
-CAI THU VIEN:
-    pip install mediapipe opencv-python numpy pandas
-================================================================================
+extract_keypoints.py - phien ban moi, uu tien MediaPipe Hands.
+Nhanh hon Holistic, hop hon voi chu cai tinh va webcam can tay.
 """
+from __future__ import annotations
+
+import os as _os
+_os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+try:
+    import faulthandler as _fh
+    _fh.enable()
+except Exception:
+    pass
+
 import argparse
 import json
 from datetime import date
 from pathlib import Path
 
-import cv2          # OpenCV: doc video, doi mau anh
-import numpy as np  # tinh toan mang so
-import pandas as pd # ghi file metadata.csv
-import mediapipe as mp  # trich keypoint (pose + face + 2 tay)
+import cv2
+import numpy as np
+import pandas as pd
 
-# "Holistic" = mo hinh tong hop cua MediaPipe, cho ra CUNG LUC:
-#   pose (than), face (mat), tay trai, tay phai.
-mp_holistic = mp.solutions.holistic
-
-# --- SO DIEM (landmark) MOI BO PHAN -----------------------------------------
-# Thu tu nay CO DINH, cac file khac (dataset, app) deu dua vao no:
-#   33 diem pose  +  468 diem mat  +  21 diem tay trai  +  21 diem tay phai
-POSE_N, FACE_N, HAND_N = 33, 468, 21
-TOTAL = POSE_N + FACE_N + HAND_N * 2  # = 543 diem/frame
-# => 2 ban tay LUON la 42 DIEM CUOI CUNG
-#    (rat quan trong: dataset lay arr[:, -42:, :] de chi giu 2 tay)
+from hand_utils import IMAGE_EXTS, VIDEO_EXTS, mp_hands, result_to_two_hand_array
 
 
-def landmarks_to_array(res):
-    """Gom toan bo landmark cua 1 frame -> mang (543, 3).
-
-    Moi diem co 3 toa do (x, y, z) da chuan hoa [0..1].
-    Bo phan nao KHONG thay trong frame (vd tay ra khoi khung) -> dien 0.
-    """
-    frame = np.zeros((TOTAL, 3), dtype=np.float32)  # mac dinh tat ca = 0
-    off = 0  # vi tri ghi hien tai trong mang
-
-    # 1) POSE (than tren) - 33 diem
-    if res.pose_landmarks:
-        for i, l in enumerate(res.pose_landmarks.landmark):
-            frame[off + i] = (l.x, l.y, l.z)
-    off += POSE_N
-
-    # 2) FACE (mat) - 468 diem
-    if res.face_landmarks:
-        for i, l in enumerate(res.face_landmarks.landmark):
-            frame[off + i] = (l.x, l.y, l.z)
-    off += FACE_N
-
-    # 3) TAY TRAI - 21 diem
-    if res.left_hand_landmarks:
-        for i, l in enumerate(res.left_hand_landmarks.landmark):
-            frame[off + i] = (l.x, l.y, l.z)
-    off += HAND_N
-
-    # 4) TAY PHAI - 21 diem
-    if res.right_hand_landmarks:
-        for i, l in enumerate(res.right_hand_landmarks.landmark):
-            frame[off + i] = (l.x, l.y, l.z)
-
-    return frame
-
-
-def extract_video(path, holistic):
-    """Doc 1 video -> mang (T, 543, 3) voi T = so frame.
-
-    Tra them:
-      - fps: khung hinh/giay (ghi vao metadata de biet toc do quay)
-      - hand_detected: so frame CO thay tay (de canh bao neu quay loi)
-    """
-    cap = cv2.VideoCapture(str(path))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frames, hand_detected = [], 0
-    while True:
-        ok, img = cap.read()
-        if not ok:
-            break  # het video
-        # MediaPipe can anh RGB, con OpenCV doc ra BGR -> phai doi mau
-        res = holistic.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        if res.left_hand_landmarks or res.right_hand_landmarks:
-            hand_detected += 1
-        frames.append(landmarks_to_array(res))
-    cap.release()
-    if not frames:
-        return None, fps, 0
-    return np.stack(frames), fps, hand_detected  # (T, 543, 3)
-
-
-def parse_signer(filename):
-    """Lay 'nguoi quay' tu ten file theo quy uoc <ma_nhan>_<signer>_<lan>.mp4.
-
-    Vi du 'xinchao_ng1_01.mp4' -> 'ng1'.
-    Dung de: (1) ghi vao metadata, (2) sau nay chia train/test theo nguoi.
-    """
+def parse_signer(filename: str) -> str:
     parts = Path(filename).stem.split("_")
     return parts[-2] if len(parts) >= 3 else "unknown"
 
 
+def extract_video(path: Path, hands, max_frames: int | None = None):
+    cap = cv2.VideoCapture(str(path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frames = []
+    detected = 0
+    while True:
+        ok, img = cap.read()
+        if not ok:
+            break
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        res = hands.process(rgb)
+        arr = result_to_two_hand_array(res)
+        if np.any(arr):
+            detected += 1
+        frames.append(arr)
+        if max_frames and len(frames) >= max_frames:
+            break
+    cap.release()
+    if not frames:
+        return None, fps, 0
+    return np.stack(frames).astype(np.float32), fps, detected
+
+
+def extract_image(path: Path, hands, n_frames: int):
+    img = cv2.imread(str(path))
+    if img is None:
+        return None, 0
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    res = hands.process(rgb)
+    arr = result_to_two_hand_array(res)
+    return np.repeat(arr[None, :, :], n_frames, axis=0).astype(np.float32), int(np.any(arr))
+
+
 def main():
-    # --- Khai bao tham so dong lenh ---
     ap = argparse.ArgumentParser()
-    ap.add_argument("--raw", default="data/raw_words", help="thu muc chua cac folder nhan")
-    ap.add_argument("--processed", default="data/processed", help="noi luu .npy")
+    ap.add_argument("--raw", default="data/raw_alphabet")
+    ap.add_argument("--processed", default="data/processed")
     ap.add_argument("--metadata", default="data/metadata.csv")
     ap.add_argument("--labels", default="data/labels.json")
-    ap.add_argument("--label-map", default=None,
-                    help='JSON anh xa {ten_folder: "ten hien thi"}, vd {"xinchao": "xin chao"}')
+    ap.add_argument("--label-map", default=None)
+    ap.add_argument("--image-frames", type=int, default=8)
+    ap.add_argument("--keep-empty", action="store_true")
+    ap.add_argument("--min-detect-conf", type=float, default=0.35)
+    ap.add_argument("--min-track-conf", type=float, default=0.35)
+    ap.add_argument("--max-frames", type=int, default=0,
+                    help="0 = doc het video; >0 = cat den so frame nay")
     args = ap.parse_args()
 
-    raw, proc = Path(args.raw), Path(args.processed)
-    proc.mkdir(parents=True, exist_ok=True)  # tao folder processed neu chua co
+    raw = Path(args.raw)
+    proc = Path(args.processed)
+    proc.mkdir(parents=True, exist_ok=True)
 
-    # (Tuy chon) doc bang anh xa ten folder khong dau -> ten hien thi co dau
     label_map = {}
     if args.label_map and Path(args.label_map).exists():
-        with open(args.label_map, encoding="utf-8") as f:
-            label_map = json.load(f)
+        label_map = json.loads(Path(args.label_map).read_text(encoding="utf-8"))
 
-    # Moi FOLDER con trong --raw = 1 nhan (vd folder 'xinchao' -> nhan "xin chao")
     label_dirs = sorted([d for d in raw.iterdir() if d.is_dir()])
     if not label_dirs:
-        print(f"[LOI] Khong thay folder nhan nao trong {raw}")
-        return
+        raise SystemExit(f"[LOI] Khong thay folder nhan trong {raw}")
 
-    # Gan moi nhan 1 so (label_id) va luu labels.json
     displays = sorted({label_map.get(d.name, d.name) for d in label_dirs})
     labels = {name: i for i, name in enumerate(displays)}
-    with open(args.labels, "w", encoding="utf-8") as f:
-        json.dump(labels, f, ensure_ascii=False, indent=2)
+    Path(args.labels).write_text(json.dumps(labels, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # --- Duyet tung video va trich keypoint ---
     rows = []
-    with mp_holistic.Holistic(static_image_mode=False, model_complexity=1,
-                              refine_face_landmarks=False) as holistic:
+    skipped = 0
+    with mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=2,
+        min_detection_confidence=args.min_detect_conf,
+        min_tracking_confidence=args.min_track_conf,
+    ) as hands_video, mp_hands.Hands(
+        static_image_mode=True,
+        max_num_hands=2,
+        min_detection_confidence=args.min_detect_conf,
+        min_tracking_confidence=args.min_track_conf,
+    ) as hands_image:
         for d in label_dirs:
             display = label_map.get(d.name, d.name)
             lid = labels[display]
-            for vid in sorted(d.glob("*.mp4")):
-                arr, fps, hand_detected = extract_video(vid, holistic)
+            files = sorted(p for p in d.iterdir() if p.is_file())
+            videos = [p for p in files if p.suffix.lower() in VIDEO_EXTS]
+            images = [p for p in files if p.suffix.lower() in IMAGE_EXTS]
+
+            for vid in videos:
+                arr, fps, detected = extract_video(vid, hands_video, None if args.max_frames <= 0 else args.max_frames)
                 if arr is None:
-                    print(f"[LOI] Khong doc duoc: {vid}")
+                    print(f"[LOI] Video hong: {vid}")
                     continue
-                # Luu mang keypoint -> file .npy (ten trung ten video)
+                if detected == 0 and not args.keep_empty:
+                    skipped += 1
+                    print(f"[BO QUA][video] {vid.name}: khong thay tay")
+                    continue
                 np.save(proc / f"{vid.stem}.npy", arr)
                 signer = parse_signer(vid.name)
-                ratio = hand_detected / max(arr.shape[0], 1)  # ti le frame thay tay
                 rows.append(dict(
-                    filename=vid.name, label=display, label_id=lid,
+                    filename=vid.name,
+                    label=display,
+                    label_id=lid,
+                    modality="video",
                     source="internet" if signer == "net" else "self",
-                    signer=signer, frames=arr.shape[0], fps=round(fps, 1),
+                    signer=signer,
+                    frames=int(arr.shape[0]),
+                    fps=round(float(fps), 1),
                     date=date.today().isoformat(),
                 ))
-                # Canh bao neu qua it frame thay tay (quay thieu sang / tay ra khoi khung)
-                warn = "" if ratio > 0.5 else "  <-- CANH BAO: it thay tay, kiem tra lai!"
-                print(f"[OK] {vid.name}: {arr.shape[0]} frame, thay tay {ratio*100:.0f}%{warn}")
+                print(f"[OK][video] {vid.name}: {arr.shape[0]} frame | thay tay {detected}/{arr.shape[0]}")
 
-    # Ghi metadata.csv (utf-8-sig de Excel mo khong loi font tieng Viet)
+            for imgp in images:
+                arr, has_hand = extract_image(imgp, hands_image, args.image_frames)
+                if arr is None:
+                    print(f"[LOI] Anh hong: {imgp}")
+                    continue
+                if not has_hand and not args.keep_empty:
+                    skipped += 1
+                    print(f"[BO QUA][anh] {imgp.name}: khong thay tay")
+                    continue
+                np.save(proc / f"{imgp.stem}.npy", arr)
+                signer = parse_signer(imgp.name)
+                rows.append(dict(
+                    filename=imgp.name,
+                    label=display,
+                    label_id=lid,
+                    modality="image",
+                    source="internet" if signer == "net" else "self",
+                    signer=signer,
+                    frames=int(arr.shape[0]),
+                    fps=0.0,
+                    date=date.today().isoformat(),
+                ))
+                print(f"[OK][anh] {imgp.name}: {arr.shape[0]} frame lap | thay tay={has_hand}")
+
     pd.DataFrame(rows).to_csv(args.metadata, index=False, encoding="utf-8-sig")
-    print(f"\n[DONE] {len(rows)} video -> {args.processed} | {args.metadata} | {args.labels}")
+    print(f"\n[DONE] {len(rows)} mau -> {args.processed} | {args.metadata} | {args.labels}")
+    if skipped:
+        print(f"[INFO] Da loai {skipped} mau khong thay tay")
 
 
 if __name__ == "__main__":

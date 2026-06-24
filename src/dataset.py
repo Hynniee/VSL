@@ -1,20 +1,10 @@
-"""
-===============================================================================
-  dataset.py - NAP DU LIEU KEYPOINT CHO MODEL (buoc 2)
-===============================================================================
+"""dataset.py - pipeline du lieu moi cho VSL.
 
-MUC DICH
---------
-PyTorch can mot doi tuong "Dataset" de biet: co bao nhieu mau, va moi mau lay
-ra nhu the nao. File nay doc metadata.csv, nap file .npy tuong ung, va tra ve
-(chuoi keypoint, do dai, nhan) cho tung video.
-
-KHAI NIEM:
-    - Dataset   : "kho" du lieu, lay tung mau theo chi so.
-    - DataLoader: (o train.py) gom nhieu mau thanh 1 "batch" de train nhanh.
-    - collate_fn: cach gom 1 batch khi cac video DAI NGAN KHAC NHAU (phai padding).
-===============================================================================
+- hands: feature engineering cho MLP/GRU/Transformer
+- hands_raw: raw joints da canonicalize cho ST-GCN
 """
+from __future__ import annotations
+
 from pathlib import Path
 
 import numpy as np
@@ -22,71 +12,74 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
+from hand_utils import augment_hand_sequence, canonicalize_hands, preprocess_landmark_array
+
 
 class VSLDataset(Dataset):
-    """Dataset cho nhan dang TU VUNG ROI (moi video = 1 nhan).
-
-    feature_mode quyet dinh lay bao nhieu diem lam dac trung:
-        "hands" = CHI 2 ban tay (42 diem) -> tranh model "hoc khuon mat/danh tinh".
-                  Day la mac dinh va NEN dung.
-        "all"   = toan bo 543 diem (pose + face + 2 tay).
-    """
-
-    def __init__(self, metadata_csv, processed_dir, max_len=60, feature_mode="hands"):
-        self.df = pd.read_csv(metadata_csv)       # bang liet ke cac mau
-        self.processed_dir = Path(processed_dir)  # noi chua .npy
-        self.max_len = max_len                    # cat video qua dai
+    def __init__(
+        self,
+        metadata_csv,
+        processed_dir,
+        max_len=16,
+        feature_mode="hands",
+        train=False,
+        augment=False,
+        seed=42,
+    ):
+        self.df = pd.read_csv(metadata_csv)
+        self.processed_dir = Path(processed_dir)
+        self.max_len = max_len
         self.feature_mode = feature_mode
-        self._feature_dim = None                  # cache sau lan dau tien
+        self.train = train
+        self.augment = augment and feature_mode in ("hands", "hands_raw")
+        self.rng = np.random.RandomState(seed)
+        self._feature_dim = None
 
     def __len__(self):
         return len(self.df)
 
-    def _load_npy(self, filename):
-        """Nap 1 file .npy -> mang 2D (T, F) san sang cho model."""
+    def _load_raw(self, filename):
         stem = Path(str(filename)).stem
-        arr = np.load(self.processed_dir / f"{stem}.npy")
-        if arr.ndim == 2:
-            # Da o dang (T, F) -> dung luon
-            return arr.astype(np.float32)
-        # arr dang (T, 543, 3):
-        if self.feature_mode == "hands":
-            # Lay 42 DIEM CUOI = 2 ban tay (xem thu tu o extract_keypoints.py)
-            arr = arr[:, -42:, :]
-        # "Duoi phang" (T, diem, 3) -> (T, diem*3) de dua vao mang
-        return arr.reshape(arr.shape[0], -1).astype(np.float32)
+        return np.load(self.processed_dir / f"{stem}.npy")
+
+    def _prepare(self, arr):
+        arr = np.asarray(arr)
+        if arr.ndim == 3 and self.feature_mode in ("hands", "hands_raw"):
+            if arr.shape[1] == 543:
+                arr = arr[:, -42:, :]
+            elif arr.shape[1] != 42:
+                raise ValueError(f"Shape landmark la: {arr.shape}")
+            arr = canonicalize_hands(arr)
+            if self.train and self.augment:
+                arr = augment_hand_sequence(arr, self.rng)
+            return preprocess_landmark_array(arr, feature_mode=self.feature_mode)
+        return preprocess_landmark_array(arr, feature_mode=self.feature_mode)
 
     def _compute_feature_dim(self):
-        first = self._load_npy(self.df.iloc[0]["filename"])
-        return first.shape[1]
+        row = self.df.iloc[0]
+        arr = self._prepare(self._load_raw(row["filename"]))
+        return int(arr.shape[1])
 
     @property
     def feature_dim(self):
-        """So chieu dac trung moi frame (model can de biet kich thuoc dau vao)."""
         if self._feature_dim is None:
             self._feature_dim = self._compute_feature_dim()
         return self._feature_dim
 
     def __getitem__(self, idx):
-        """Tra 1 mau: (chuoi keypoint, do dai that, nhan dang so)."""
         row = self.df.iloc[idx]
-        seq = self._load_npy(row["filename"])
+        seq = self._prepare(self._load_raw(row["filename"]))
         if seq.shape[0] > self.max_len:
-            seq = seq[: self.max_len]  # cat neu qua dai
-        return torch.from_numpy(seq), seq.shape[0], int(row["label_id"])
+            ids = np.linspace(0, seq.shape[0] - 1, self.max_len).round().astype(int)
+            seq = seq[ids]
+        return torch.from_numpy(seq.astype(np.float32)), seq.shape[0], int(row["label_id"])
 
 
 def collate_fn(batch):
-    """Gom 1 batch + PADDING cac chuoi ve cung do dai.
-
-    Vi moi video so frame khac nhau, khong the xep thang thanh 1 khoi.
-    Cach lam: lay do dai lon nhat trong batch, cac chuoi ngan hon -> dem 0.
-    'lengths' luu do dai THAT de model bo qua phan dem.
-    """
     seqs, lengths, labels = zip(*batch)
-    feat = seqs[0].shape[1]
-    max_len = max(s.shape[0] for s in seqs)
+    feat = int(seqs[0].shape[1])
+    max_len = max(int(s.shape[0]) for s in seqs)
     padded = torch.zeros(len(seqs), max_len, feat, dtype=torch.float32)
-    for i, s in enumerate(seqs):
-        padded[i, : s.shape[0]] = s  # phan con lai giu nguyen 0 (dem)
-    return padded, torch.tensor(lengths), torch.tensor(labels)
+    for i, seq in enumerate(seqs):
+        padded[i, :seq.shape[0]] = seq
+    return padded, torch.tensor(lengths, dtype=torch.long), torch.tensor(labels, dtype=torch.long)

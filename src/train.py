@@ -1,173 +1,301 @@
-"""
-================================================================================
- train.py - HUAN LUYEN MODEL NHAN DANG TU VUNG (buoc 4)
-================================================================================
+"""train.py - huan luyen phien ban moi, toi uu cho GPU va co ST-GCN raw joints."""
+from __future__ import annotations
 
-Doc du lieu -> chia train/val -> lap nhieu EPOCH de model hoc -> luu ban tot nhat.
+# --- Fix OpenMP trung runtime (libiomp5md.dll) tren Windows: PyTorch + NumPy(MKL) + MediaPipe ---
+import os as _os
+_os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+try:
+    import faulthandler as _fh
+    _fh.enable()  # native crash se in stack thay vi thoat im lang
+except Exception:
+    pass
+# -------------------------------------------------------------------------------------------
 
-CACH CHAY:
-    # chia ngau nhien theo mau (mac dinh)
-    python src/train.py --model lstm --epochs 50 --batch 16
-
-    # chia theo NGUOI: tu boc ngau nhien 1 nguoi lam test (can >=2 nguoi)
-    python src/train.py --model lstm --val-signer-count 1
-
-    # chi dinh cu the ai lam test
-    python src/train.py --model lstm --val-signer ng3
-
-KHAI NIEM NHANH:
-    - epoch   : 1 lan model hoc het toan bo du lieu train.
-    - loss    : "do sai" cua model, cang nho cang tot.
-    - val_acc : do chinh xac tren tap VALIDATION (du lieu model khong train) -> dang tin.
-================================================================================
-"""
 import argparse
+import copy
 import json
+import random
+import time
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Subset
 
 from dataset import VSLDataset, collate_fn
-from model import build_model
+from model import available_models, build_model
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--metadata", default="data/metadata.csv")
     p.add_argument("--processed", default="data/processed")
     p.add_argument("--labels", default="data/labels.json")
-    p.add_argument("--model", default="lstm", choices=["lstm", "transformer"])
-    p.add_argument("--epochs", type=int, default=50, help="so vong hoc")
-    p.add_argument("--batch", type=int, default=16, help="so mau moi lan cap nhat")
-    p.add_argument("--lr", type=float, default=1e-3, help="toc do hoc")
-    p.add_argument("--max-len", type=int, default=60)
-    p.add_argument("--feature-mode", default="hands", choices=["hands", "all"])
-    p.add_argument("--val-size", type=float, default=0.2, help="ti le val khi chia ngau nhien")
-    p.add_argument("--val-signer", default=None,
-                   help="Chi dinh CU THE signer lam val (vd 'ng3'). Nhieu nguoi: 'ng2,ng3'")
-    p.add_argument("--val-signer-count", type=int, default=0,
-                   help="Neu >0: NGAU NHIEN boc bay nhieu nguoi lam val (vd 1 = giu lai 1 nguoi test)")
-    p.add_argument("--out", default="checkpoints/best.pth", help="noi luu model tot nhat")
-    p.add_argument("--seed", type=int, default=42, help="hat giong ngau nhien (de lap lai duoc)")
-    return p.parse_args()
+    p.add_argument("--model", default="mlp", choices=available_models())
+    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--batch", type=int, default=64)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--label-smoothing", type=float, default=0.05)
+    p.add_argument("--max-len", type=int, default=16)
+    p.add_argument("--feature-mode", default="hands", choices=["hands", "hands_raw", "all"])
+    p.add_argument("--val-size", type=float, default=0.2)
+    p.add_argument("--out", default="checkpoints/best.pth")
+    p.add_argument("--metrics-out", default=None)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--workers", type=int, default=0, help="Windows nen de 0 cho on dinh")
+    p.add_argument("--patience", type=int, default=10)
+    p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    p.add_argument("--no-amp", action="store_true")
+    return p.parse_args(argv)
 
 
-def evaluate(model, loader, device):
-    """Tinh do chinh xac tren 1 tap (khong cap nhat trong so)."""
-    model.eval()  # che do danh gia (tat dropout)
-    total, correct = 0, 0
-    with torch.no_grad():  # khong tinh gradient -> nhanh, do ton bo nho
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def resolve_device(device_arg):
+    if device_arg == "cpu":
+        return "cpu"
+    if device_arg == "cuda":
+        return "cuda"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def make_loader(ds, idxs, batch, workers, shuffle, device):
+    subset = Subset(ds, idxs)
+    return DataLoader(
+        subset,
+        batch_size=batch,
+        shuffle=shuffle,
+        collate_fn=collate_fn,
+        num_workers=workers,
+        pin_memory=(device == "cuda"),
+        persistent_workers=(workers > 0),
+    )
+
+
+def macro_metrics(ys, ps, label_names):
+    acc = accuracy_score(ys, ps)
+    prec, rec, f1, _ = precision_recall_fscore_support(ys, ps, average="macro", zero_division=0)
+    p_c, r_c, f_c, sup = precision_recall_fscore_support(
+        ys, ps, labels=list(range(len(label_names))), zero_division=0
+    )
+    per_class = {
+        label_names[i]: {
+            "precision": float(p_c[i]),
+            "recall": float(r_c[i]),
+            "f1": float(f_c[i]),
+            "support": int(sup[i]),
+        }
+        for i in range(len(label_names))
+    }
+    cm = confusion_matrix(ys, ps, labels=list(range(len(label_names)))).tolist()
+    return {
+        "val_accuracy": float(acc),
+        "macro_precision": float(prec),
+        "macro_recall": float(rec),
+        "macro_f1": float(f1),
+        "per_class": per_class,
+        "confusion_matrix": cm,
+        "label_names": label_names,
+    }
+
+
+def evaluate(model, loader, device, amp_enabled, label_names):
+    model.eval()
+    ys, ps = [], []
+    n = 0
+    t_total = 0.0
+    with torch.no_grad():
         for x, lengths, y in loader:
-            x, lengths, y = x.to(device), lengths.to(device), y.to(device)
-            correct += (model(x, lengths).argmax(1) == y).sum().item()
-            total += y.size(0)
-    return correct / max(total, 1)
+            x = x.to(device, non_blocking=True)
+            lengths = lengths.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            t0 = time.perf_counter()
+            with torch.autocast(device_type="cuda", enabled=amp_enabled):
+                logits = model(x, lengths)
+            if device == "cuda":
+                torch.cuda.synchronize()
+            t_total += time.perf_counter() - t0
+            pred = logits.argmax(1)
+            ys.extend(y.cpu().tolist())
+            ps.extend(pred.cpu().tolist())
+            n += y.size(0)
+    out = macro_metrics(ys, ps, label_names)
+    out["inference_ms_per_sample"] = float(t_total / max(n, 1) * 1000)
+    out["num_val_samples"] = int(n)
+    return out
 
 
-def main():
-    args = parse_args()
-    # Co dinh ngau nhien -> chay lai cho ket qua giong nhau (de so sanh)
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    # Tu dung GPU (card RTX) neu co, khong thi CPU
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[INFO] Thiet bi: {device}")
+def tune_args_for_model(args):
+    if args.model == "stgcn":
+        if args.feature_mode == "hands":
+            args.feature_mode = "hands_raw"
+            print("[INFO] ST-GCN tu dong chuyen feature_mode -> hands_raw", flush=True)
+        args.lr = min(args.lr, 2e-4)
+        args.weight_decay = max(args.weight_decay, 3e-4)
+        args.label_smoothing = min(args.label_smoothing, 0.03)
+        args.max_len = max(args.max_len, 12)
+        args.patience = max(args.patience, 12)
+    return args
 
-    with open(args.labels, encoding="utf-8") as f:
-        labels = json.load(f)
+
+def train_model(args):
+    args = tune_args_for_model(args)
+    set_seed(args.seed)
+    device = resolve_device(args.device)
+    amp_enabled = (device == "cuda" and not args.no_amp)
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = True
+    print(f"[INFO] Thiet bi: {device} | Model: {args.model}", flush=True)
+
+    labels = json.loads(Path(args.labels).read_text(encoding="utf-8"))
     num_classes = len(labels)
+    id2label = {v: k for k, v in labels.items()}
+    label_names = [id2label[i] for i in range(num_classes)]
 
-    ds = VSLDataset(args.metadata, args.processed, args.max_len, args.feature_mode)
-    feature_dim = ds.feature_dim
-    print(f"[INFO] So lop: {num_classes} | So mau: {len(ds)} | feature_dim: {feature_dim}")
+    print("[INFO] Dang nap dataset...", flush=True)
+    ds_train = VSLDataset(args.metadata, args.processed, max_len=args.max_len,
+                          feature_mode=args.feature_mode, train=True, augment=True, seed=args.seed)
+    ds_eval = VSLDataset(args.metadata, args.processed, max_len=args.max_len,
+                         feature_mode=args.feature_mode, train=False, augment=False, seed=args.seed)
+    feature_dim = ds_train.feature_dim
+    print(f"[INFO] So lop: {num_classes} | So mau: {len(ds_train)} | feature_dim: {feature_dim} | feature_mode: {args.feature_mode}", flush=True)
 
-    # ----------------------------------------------------------------------
-    # CHIA TRAIN / VALIDATION - co 3 cach (uu tien tu tren xuong):
-    #   1) --val-signer ng3      -> chi dinh CU THE ai lam test.
-    #   2) --val-signer-count 1  -> NGAU NHIEN boc bay nhieu nguoi lam test,
-    #                               phan con lai de train (do kha nang nhan NGUOI MOI).
-    #   3) (mac dinh)            -> chia ngau nhien theo MAU, phan tang theo nhan (stratify).
-    #
-    # LUU Y: cach 1 & 2 phan anh thuc te hon (test nguoi chua tung thay),
-    #        nhung can >= 2 nguoi quay. Chi 1 nguoi -> dung cach 3, va val_acc
-    #        se "cao ao" vi train/test cung 1 nguoi.
-    # ----------------------------------------------------------------------
-    idx = np.arange(len(ds))
-    signers = ds.df["signer"].astype(str).to_numpy()
-    val_signers = None
-    if args.val_signer:
-        val_signers = [s.strip() for s in args.val_signer.split(",") if s.strip()]
-    elif args.val_signer_count > 0:
-        uniq = sorted(set(signers))
-        if args.val_signer_count >= len(uniq):
-            raise SystemExit(f"[LOI] Co {len(uniq)} signer ({uniq}), khong the giu "
-                             f"{args.val_signer_count} lam val (phai con nguoi de train).")
-        rng = np.random.RandomState(args.seed)
-        val_signers = list(rng.choice(uniq, size=args.val_signer_count, replace=False))
+    idx = np.arange(len(ds_train))
+    label_ids = ds_train.df["label_id"].to_numpy()
+    tr_idx, va_idx = train_test_split(
+        idx,
+        test_size=args.val_size,
+        random_state=args.seed,
+        stratify=label_ids if num_classes > 1 else None,
+    )
+    print(f"[INFO] Train/Val = {len(tr_idx)}/{len(va_idx)}", flush=True)
 
-    if val_signers is not None:
-        mask_val = np.isin(signers, val_signers)
-        va_idx, tr_idx = idx[mask_val], idx[~mask_val]
-        if len(va_idx) == 0:
-            raise SystemExit(f"[LOI] Khong co video nao cua signer {val_signers}")
-        if len(tr_idx) == 0:
-            raise SystemExit("[LOI] Khong con video nao de train. Can it nhat 2 signer.")
-        print(f"[INFO] Chia theo NGUOI: val = {val_signers} ({len(va_idx)} mau) "
-              f"| train = {len(tr_idx)} mau")
-    else:
-        label_ids = ds.df["label_id"].to_numpy()
-        tr_idx, va_idx = train_test_split(
-            idx, test_size=args.val_size, random_state=args.seed,
-            stratify=label_ids if num_classes > 1 else None,
-        )
-
-    # DataLoader: tu chia batch + xao tron (train) + goi collate_fn de padding
-    tr_loader = DataLoader(Subset(ds, tr_idx), batch_size=args.batch,
-                           shuffle=True, collate_fn=collate_fn)
-    va_loader = DataLoader(Subset(ds, va_idx), batch_size=args.batch,
-                           shuffle=False, collate_fn=collate_fn)
+    tr_loader = make_loader(ds_train, tr_idx, args.batch, args.workers, True, device)
+    va_loader = make_loader(ds_eval, va_idx, args.batch, args.workers, False, device)
 
     model = build_model(args.model, feature_dim, num_classes).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)  # thuat toan cap nhat trong so
-    crit = nn.CrossEntropyLoss()  # ham loss cho bai toan phan loai
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[INFO] So tham so: {n_params:,}", flush=True)
+
+    class_counts = np.bincount(label_ids[tr_idx], minlength=num_classes).astype(np.float32)
+    class_weights = class_counts.sum() / np.clip(class_counts, 1.0, None)
+    class_weights = torch.tensor(class_weights / class_weights.mean(), dtype=torch.float32, device=device)
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=args.label_smoothing)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    best_acc = 0.0
+    best_score = -1.0
+    best_state = None
+    best_metrics = None
+    bad_epochs = 0
+    t_train0 = time.perf_counter()
+
     for epoch in range(1, args.epochs + 1):
-        model.train()  # che do hoc (bat dropout)
-        total, correct, loss_sum = 0, 0, 0.0
+        model.train()
+        total = correct = 0
+        loss_sum = 0.0
         for x, lengths, y in tr_loader:
-            x, lengths, y = x.to(device), lengths.to(device), y.to(device)
-            opt.zero_grad()           # xoa gradient cu
-            logits = model(x, lengths)
-            loss = crit(logits, y)    # tinh do sai
-            loss.backward()           # lan truyen nguoc -> tinh gradient
-            opt.step()                # cap nhat trong so
+            x = x.to(device, non_blocking=True)
+            lengths = lengths.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", enabled=amp_enabled):
+                logits = model(x, lengths)
+                loss = criterion(logits, y)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
             loss_sum += loss.item() * y.size(0)
             correct += (logits.argmax(1) == y).sum().item()
             total += y.size(0)
-        tr_acc = correct / max(total, 1)
-        va_acc = evaluate(model, va_loader, device)
-        print(f"Epoch {epoch:3d} | loss {loss_sum/max(total,1):.4f} "
-              f"| train_acc {tr_acc:.3f} | val_acc {va_acc:.3f}")
+        scheduler.step()
 
-        # Luu lai model co val_acc TOT NHAT (kem du thong tin de dung lai)
-        if va_acc >= best_acc:
-            best_acc = va_acc
+        train_acc = correct / max(total, 1)
+        val_metrics = evaluate(model, va_loader, device, amp_enabled, label_names)
+        score = val_metrics["macro_f1"]
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(
+            f"Epoch {epoch:03d}/{args.epochs} | loss {loss_sum/max(total,1):.4f} | "
+            f"train_acc {train_acc:.3f} | val_acc {val_metrics['val_accuracy']:.3f} | "
+            f"val_f1 {val_metrics['macro_f1']:.3f} | lr {lr_now:.2e}",
+            flush=True,
+        )
+
+        if score > best_score:
+            best_score = score
+            best_state = copy.deepcopy(model.state_dict())
+            best_metrics = copy.deepcopy(val_metrics)
+            bad_epochs = 0
             torch.save({
                 "model": args.model,
-                "state_dict": model.state_dict(),
-                "feature_dim": feature_dim,
-                "num_classes": num_classes,
+                "state_dict": best_state,
+                "feature_dim": int(feature_dim),
+                "num_classes": int(num_classes),
                 "labels": labels,
-                "max_len": args.max_len,
+                "max_len": int(args.max_len),
                 "feature_mode": args.feature_mode,
+                "input_representation": "hands_raw_v1" if args.feature_mode == "hands_raw" else "hand_features_v2",
+                "infer_window": min(int(args.max_len), 8),
             }, args.out)
-    print(f"[DONE] Val accuracy tot nhat: {best_acc:.3f} | luu tai: {args.out}")
+        else:
+            bad_epochs += 1
+            if bad_epochs >= args.patience:
+                print(f"[INFO] Early stopping sau {bad_epochs} epoch khong cai thien", flush=True)
+                break
+
+    train_time = time.perf_counter() - t_train0
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    metrics = best_metrics or evaluate(model, va_loader, device, amp_enabled, label_names)
+    metrics.update({
+        "model": args.model,
+        "epochs": int(args.epochs),
+        "num_params": int(n_params),
+        "train_time_sec": float(train_time),
+        "feature_dim": int(feature_dim),
+        "num_classes": int(num_classes),
+        "num_train_samples": int(len(tr_idx)),
+        "checkpoint": str(args.out),
+        "device": device,
+        "amp": bool(amp_enabled),
+        "feature_mode": args.feature_mode,
+    })
+
+    metrics_out = args.metrics_out or str(Path(args.out).with_suffix("").as_posix() + "_metrics.json")
+    Path(metrics_out).parent.mkdir(parents=True, exist_ok=True)
+    Path(metrics_out).write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print("\n" + "-" * 64, flush=True)
+    print(f"KET QUA [{args.model}]", flush=True)
+    print("-" * 64, flush=True)
+    print(f"Val accuracy    : {metrics['val_accuracy']*100:6.2f}%", flush=True)
+    print(f"Macro F1        : {metrics['macro_f1']*100:6.2f}%", flush=True)
+    print(f"Precision       : {metrics['macro_precision']*100:6.2f}%", flush=True)
+    print(f"Recall          : {metrics['macro_recall']*100:6.2f}%", flush=True)
+    print(f"Infer speed     : {metrics['inference_ms_per_sample']:.3f} ms/mau", flush=True)
+    print(f"Train time      : {train_time:.1f}s", flush=True)
+    print(f"Model luu tai   : {args.out}", flush=True)
+    print(f"Metrics luu tai : {metrics_out}", flush=True)
+    print("-" * 64, flush=True)
+    return metrics
+
+
+def main():
+    train_model(parse_args())
 
 
 if __name__ == "__main__":
