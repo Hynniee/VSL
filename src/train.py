@@ -41,7 +41,7 @@ def parse_args(argv=None):
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--label-smoothing", type=float, default=0.05)
     p.add_argument("--max-len", type=int, default=16)
-    p.add_argument("--feature-mode", default="hands", choices=["hands", "hands_raw", "all"])
+    p.add_argument("--feature-mode", default="hands", choices=["hands", "hands_raw", "all", "unified"])
     p.add_argument("--val-size", type=float, default=0.2)
     p.add_argument("--out", default="checkpoints/best.pth")
     p.add_argument("--metrics-out", default=None)
@@ -135,6 +135,16 @@ def evaluate(model, loader, device, amp_enabled, label_names):
 
 
 def tune_args_for_model(args):
+    if args.model == "unified":
+        if args.feature_mode != "unified":
+            args.feature_mode = "unified"
+            print("[INFO] Model unified tu dong chuyen feature_mode -> unified", flush=True)
+        args.lr = min(args.lr, 2e-4)
+        args.weight_decay = max(args.weight_decay, 3e-4)
+        args.label_smoothing = min(args.label_smoothing, 0.03)
+        args.max_len = max(args.max_len, 24)
+        args.patience = max(args.patience, 14)
+        return args
     if args.model == "stgcn":
         if args.feature_mode == "hands":
             args.feature_mode = "hands_raw"
@@ -193,7 +203,7 @@ def train_model(args):
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=args.label_smoothing)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     best_score = -1.0
@@ -248,7 +258,7 @@ def train_model(args):
                 "labels": labels,
                 "max_len": int(args.max_len),
                 "feature_mode": args.feature_mode,
-                "input_representation": "hands_raw_v1" if args.feature_mode == "hands_raw" else "hand_features_v2",
+                "input_representation": ("unified_holistic_v1" if args.feature_mode == "unified" else ("hands_raw_v1" if args.feature_mode == "hands_raw" else "hand_features_v2")),
                 "infer_window": min(int(args.max_len), 8),
             }, args.out)
         else:

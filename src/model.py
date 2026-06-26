@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from hand_utils import CROSS_HAND_EDGES, HAND_EDGES
+from pose_utils import NUM_UNIFIED_JOINTS, UNIFIED_EDGES
 
 
 class MaskedPooling(nn.Module):
@@ -288,11 +289,103 @@ class STGCNClassifier(nn.Module):
         return self.head(torch.cat([mean, std, hmax], dim=1))
 
 
+def build_unified_adjacency(num_joints: int) -> torch.Tensor:
+    """Do thi khop cho schema GOP (pose + 2 tay + mat)."""
+    A = torch.eye(num_joints, dtype=torch.float32)
+    if num_joints == NUM_UNIFIED_JOINTS:
+        for a, b in UNIFIED_EDGES:
+            A[a, b] = 1.0
+            A[b, a] = 1.0
+    deg = A.sum(1)
+    d_inv_sqrt = deg.clamp(min=1.0).pow(-0.5)
+    A = d_inv_sqrt[:, None] * A * d_inv_sqrt[None, :]
+    return A
+
+
+class HolisticSTGCNClassifier(nn.Module):
+    """ST-GCN GOP: dung CHUNG du lieu chi-co-tay (cu) lan day-du (moi).
+
+    Input flatten (T, V*4) voi 4 = [x, y, z, presence].
+    - presence = 0 -> khop vang (vd pose/mat trong du lieu cu). Toa do bi zero,
+      nhung kenh presence cho model biet khop do "vang" (khac voi o goc toa do).
+    - velocity tinh noi bo de bat chuyen dong.
+    - pooling theo thoi gian dung lengths; pooling theo khop bo qua khop vang.
+    """
+    def __init__(self, input_size, num_classes, hidden=64, dropout=0.2):
+        super().__init__()
+        if input_size % 4 != 0:
+            raise ValueError(
+                f"Holistic ST-GCN can input dang [x,y,z,presence] (chia het 4), nhan {input_size}"
+            )
+        self.num_joints = input_size // 4
+        A = build_unified_adjacency(self.num_joints)
+        in_ch = 3 + 3 + 1  # coords + velocity + presence
+        self.in_ch = in_ch
+        self.data_bn = nn.BatchNorm1d(self.num_joints * in_ch)
+        self.blocks = nn.ModuleList([
+            STGCNBlock(in_ch, hidden, A, stride=1, dropout=dropout, residual=False),
+            STGCNBlock(hidden, hidden, A, stride=1, dropout=dropout),
+            STGCNBlock(hidden, hidden * 2, A, stride=2, dropout=dropout),
+            STGCNBlock(hidden * 2, hidden * 2, A, stride=1, dropout=dropout),
+            STGCNBlock(hidden * 2, hidden * 4, A, stride=2, dropout=dropout),
+        ])
+        out_ch = hidden * 4
+        self.head = nn.Sequential(
+            nn.LayerNorm(out_ch * 3),
+            nn.Linear(out_ch * 3, out_ch * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(out_ch * 2, num_classes),
+        )
+
+    def forward(self, x, lengths):
+        b, t, f = x.shape
+        v = self.num_joints
+        feat = x.view(b, t, v, 4)
+        coords = feat[..., :3]
+        p = feat[..., 3:4]                       # (B,T,V,1) presence
+        coords = coords * p                      # zero khop vang
+        cc = coords.permute(0, 3, 1, 2).contiguous()      # (B,3,T,V)
+        vel = torch.diff(cc, dim=2, prepend=cc[:, :, :1])
+        pc = p.permute(0, 3, 1, 2).contiguous()           # (B,1,T,V)
+        vel = vel * pc
+        h = torch.cat([cc, vel, pc], dim=1)               # (B,7,T,V)
+        h = h.permute(0, 2, 3, 1).contiguous().view(b, t, v * self.in_ch)
+        h = self.data_bn(h.transpose(1, 2)).transpose(1, 2)
+        h = h.view(b, t, v, self.in_ch).permute(0, 3, 1, 2).contiguous()
+
+        # khop co xuat hien trong chuoi (B,V)
+        joint_pres = (p.squeeze(-1).amax(dim=1) > 0.5).float()
+
+        cur_len = lengths.clone()
+        for blk in self.blocks:
+            h = blk(h)
+            if blk.stride > 1:
+                cur_len = (cur_len + blk.stride - 1) // blk.stride
+
+        # pooling theo thoi gian (bo qua frame dem)
+        t2 = h.size(2)
+        tmask = (torch.arange(t2, device=h.device)[None, :] < cur_len[:, None]).float()
+        tm = tmask[:, None, :, None]
+        h_mean_joint = (h * tm).sum(dim=2) / tm.sum(dim=2).clamp(min=1.0)   # (B,C,V)
+        h_max_joint = h.masked_fill(tm == 0, -1e4).amax(dim=2)             # (B,C,V)
+
+        # pooling theo khop (bo qua khop vang)
+        jm = joint_pres[:, None, :]                                        # (B,1,V)
+        denom = jm.sum(dim=2).clamp(min=1.0)                               # (B,1)
+        mean = (h_mean_joint * jm).sum(dim=2) / denom                      # (B,C)
+        var = ((h_mean_joint - mean[:, :, None]) ** 2 * jm).sum(dim=2) / denom
+        std = torch.sqrt(var.clamp(min=1e-6))                              # (B,C)
+        hmax = h_max_joint.masked_fill(jm == 0, -1e4).amax(dim=2)          # (B,C)
+        return self.head(torch.cat([mean, std, hmax], dim=1))
+
+
 _MODELS = {
     "mlp": TemporalMLPClassifier,
     "gru": GRUAttentionClassifier,
     "transformer": TransformerClassifier,
     "stgcn": STGCNClassifier,
+    "unified": HolisticSTGCNClassifier,
 }
 
 
@@ -302,7 +395,7 @@ def available_models():
 
 def build_model(name, input_size, num_classes):
     key = name.lower().replace("-", "").replace("_", "")
-    alias = {"temporalmlp": "mlp", "fast": "mlp", "bigru": "gru", "stcgn": "stgcn", "stgcn": "stgcn"}
+    alias = {"temporalmlp": "mlp", "fast": "mlp", "bigru": "gru", "stcgn": "stgcn", "stgcn": "stgcn", "holistic": "unified", "holisticstgcn": "unified", "unifiedstgcn": "unified", "unified": "unified"}
     key = alias.get(key, key)
     if key not in _MODELS:
         raise ValueError(f"Model chua ho tro: {name}. Chon 1 trong {available_models()}")

@@ -16,12 +16,16 @@ import torch
 import torch.nn.functional as F
 
 from hand_utils import preprocess_landmark_array
+from pose_utils import prepare_unified
 from model import build_model
 
 
 def load_sequence(npy_path, feature_mode, max_len):
     arr = np.load(npy_path)
-    seq = preprocess_landmark_array(arr, feature_mode)
+    if feature_mode == "unified":
+        seq = prepare_unified(arr)
+    else:
+        seq = preprocess_landmark_array(arr, feature_mode)
     if seq.shape[0] > max_len:
         ids = np.linspace(0, seq.shape[0] - 1, max_len).round().astype(int)
         seq = seq[ids]

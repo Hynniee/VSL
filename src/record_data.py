@@ -42,10 +42,15 @@ import numpy as np
 
 try:
     from hand_utils import draw_guide_box, draw_hand_landmarks, mp_hands
+    from pose_utils import draw_holistic_landmarks, mp_holistic
     _HAS_MP = True
 except Exception:  # mediapipe chua cai cung khong sao, chi mat overlay
     _HAS_MP = False
     mp_hands = None
+    mp_holistic = None
+
+    def draw_holistic_landmarks(img, res, **kw):
+        return img
 
     def draw_guide_box(img, text="Dat tay vao khung"):
         h, w = img.shape[:2]
@@ -160,6 +165,8 @@ def main():
     ap.add_argument("--out-root", default="data")
     ap.add_argument("--label-map-name", default="label_map.json")
     ap.add_argument("--mirror", action="store_true")
+    ap.add_argument("--overlay", default="holistic", choices=["holistic", "hands", "none"],
+                    help="Kieu ve diem len ban xem truoc (KHONG ghi vao file luu)")
     args = ap.parse_args()
 
     # Danh sach signer (display, code). Them --signer neu la nguoi moi.
@@ -203,10 +210,21 @@ def main():
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
 
-    hands = None
-    if _HAS_MP and mp_hands is not None:
-        hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2,
-                               min_detection_confidence=0.4, min_tracking_confidence=0.4)
+    processor = None
+    overlay_kind = "none"
+    if _HAS_MP and args.overlay != "none":
+        if args.overlay == "holistic" and mp_holistic is not None:
+            processor = mp_holistic.Holistic(
+                static_image_mode=False, model_complexity=1,
+                refine_face_landmarks=True,
+                min_detection_confidence=0.4, min_tracking_confidence=0.4)
+            overlay_kind = "holistic"
+        elif mp_hands is not None:
+            processor = mp_hands.Hands(
+                static_image_mode=False, max_num_hands=2,
+                min_detection_confidence=0.4, min_tracking_confidence=0.4)
+            overlay_kind = "hands"
+    print(f"  Overlay: {overlay_kind} (ve len ban xem truoc, khong ghi vao file)")
 
     print("=" * 66)
     print("  L=nhan | S=doi signer | N=signer moi | C=chup | SPACE=quay | Q=thoat")
@@ -220,9 +238,11 @@ def main():
     def overlay(frame):
         vis = frame.copy()
         draw_guide_box(vis)
-        if hands is not None:
-            res = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            if getattr(res, "multi_hand_landmarks", None):
+        if processor is not None:
+            res = processor.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            if overlay_kind == "holistic":
+                draw_holistic_landmarks(vis, res)
+            elif getattr(res, "multi_hand_landmarks", None):
                 for i, lm in enumerate(res.multi_hand_landmarks):
                     draw_hand_landmarks(vis, lm, (0, 255, 0) if i == 0 else (255, 0, 255))
         return vis
@@ -340,8 +360,8 @@ def main():
     if writer is not None:
         writer.release()
     cap.release()
-    if hands is not None:
-        hands.close()
+    if processor is not None:
+        processor.close()
     cv2.destroyAllWindows()
     print(f"\n[DONE] Tong cong da luu {saved} mau cho phien nay.")
     if raw_subdir is not None:

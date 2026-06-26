@@ -13,6 +13,13 @@ import torch
 from torch.utils.data import Dataset
 
 from hand_utils import augment_hand_sequence, canonicalize_hands, preprocess_landmark_array
+from pose_utils import (
+    NUM_UNIFIED_JOINTS,
+    augment_unified_sequence,
+    canonicalize_unified,
+    embed_hands_only,
+    pack_unified,
+)
 
 
 class VSLDataset(Dataset):
@@ -31,7 +38,7 @@ class VSLDataset(Dataset):
         self.max_len = max_len
         self.feature_mode = feature_mode
         self.train = train
-        self.augment = augment and feature_mode in ("hands", "hands_raw")
+        self.augment = augment and feature_mode in ("hands", "hands_raw", "unified")
         self.rng = np.random.RandomState(seed)
         self._feature_dim = None
 
@@ -44,6 +51,8 @@ class VSLDataset(Dataset):
 
     def _prepare(self, arr):
         arr = np.asarray(arr)
+        if self.feature_mode == "unified":
+            return self._prepare_unified(arr)
         if arr.ndim == 3 and self.feature_mode in ("hands", "hands_raw"):
             if arr.shape[1] == 543:
                 arr = arr[:, -42:, :]
@@ -54,6 +63,26 @@ class VSLDataset(Dataset):
                 arr = augment_hand_sequence(arr, self.rng)
             return preprocess_landmark_array(arr, feature_mode=self.feature_mode)
         return preprocess_landmark_array(arr, feature_mode=self.feature_mode)
+
+    def _prepare_unified(self, arr):
+        if arr.ndim != 3:
+            raise ValueError(f"Unified can mang 3 chieu, nhan {arr.shape}")
+        if arr.shape[2] == 4:
+            coords = arr[:, :, :3].astype(np.float32).copy()
+            mask = arr[:, :, 3] > 0.5
+        elif arr.shape[1] == 42 and arr.shape[2] == 3:
+            coords, mask = embed_hands_only(arr)
+        elif arr.shape[1] == NUM_UNIFIED_JOINTS and arr.shape[2] == 3:
+            coords = arr.astype(np.float32).copy()
+            mask = np.any(arr != 0, axis=2)
+        elif arr.shape[1] == 543 and arr.shape[2] == 3:
+            coords, mask = embed_hands_only(arr[:, -42:, :])
+        else:
+            raise ValueError(f"Layout unified khong ho tro: {arr.shape}")
+        coords = canonicalize_unified(coords, mask)
+        if self.train and self.augment:
+            coords, mask = augment_unified_sequence(coords, mask, self.rng)
+        return pack_unified(coords, mask)
 
     def _compute_feature_dim(self):
         row = self.df.iloc[0]

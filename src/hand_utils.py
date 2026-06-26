@@ -7,11 +7,18 @@ from __future__ import annotations
 
 import math
 
-import cv2
-import mediapipe as mp
 import numpy as np
 
-mp_hands = mp.solutions.hands
+try:
+    import cv2
+except Exception:  # cv2 co the vang trong vai moi truong
+    cv2 = None
+try:
+    import mediapipe as mp
+    mp_hands = mp.solutions.hands
+except Exception:  # mediapipe chua cai -> van import duoc cac hang so/ham numpy
+    mp = None
+    mp_hands = None
 
 HAND_EDGES = [
     (0, 1), (1, 2), (2, 3), (3, 4),

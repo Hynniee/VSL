@@ -31,7 +31,7 @@ def parse_args():
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--label-smoothing", type=float, default=0.05)
     p.add_argument("--max-len", type=int, default=16)
-    p.add_argument("--feature-mode", default="hands", choices=["hands", "hands_raw", "all"])
+    p.add_argument("--feature-mode", default="hands", choices=["hands", "hands_raw", "all", "unified"])
     p.add_argument("--val-size", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--workers", type=int, default=0)
