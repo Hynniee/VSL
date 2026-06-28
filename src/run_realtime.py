@@ -394,8 +394,12 @@ def main():
             if img is None:
                 time.sleep(0.005)
                 continue
-            if mirror:
-                img = cv2.flip(img, 1)
+            # QUAN TRONG: KHONG lat guong truoc khi cho MediaPipe xu ly.
+            # Du lieu train (record_data.py mac dinh KHONG --mirror) duoc trich
+            # tu khung GOC, nen MediaPipe gan tay trai/phai theo khung goc.
+            # Neu o day lat guong, tay trai<->phai bi DAO -> roi sai o (LHAND/RHAND)
+            # -> model khong nhan dien duoc (nhat la chu cai 1 tay).
+            # Vi vay: xu ly khung GOC, chi lat guong cho HIEN THI o cuoi.
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             ps = args.proc_scale
             proc_in = cv2.resize(rgb, None, fx=ps, fy=ps, interpolation=cv2.INTER_AREA) if ps < 0.99 else rgb
@@ -476,6 +480,9 @@ def main():
                 inst = 1.0 / dt
                 fps = inst if fps == 0.0 else (0.9 * fps + 0.1 * inst)
 
+            # Lat guong CHI cho hien thi (sau khi da ve landmark de van khop diem).
+            if mirror:
+                vis = cv2.flip(vis, 1)
             cv2.putText(vis, f"FPS {fps:.1f}", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
                         (0, 255, 255), 2, cv2.LINE_AA)
             if cooldown > 0:

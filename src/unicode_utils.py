@@ -13,6 +13,14 @@ VI DU:
     chu_a + dau_trang              -> ă
     chu_o + dau_rau + thanh_huyen  -> ờ
 
+QUY TAC HOP LE (MOI):
+    - dau_mu (^)     chi ap dung cho: a, e, o   -> â ê ô
+    - dau_trang (breve) chi ap dung cho: a      -> ă
+    - dau_rau (horn)  chi ap dung cho: o, u      -> ơ ư
+    - dau thanh (sac/huyen/hoi/nga/nang) chi ap dung cho NGUYEN AM
+      (a, e, i, o, u, y -- ke ca sau khi da them dau bien doi).
+    - Neu ghep KHONG hop le (vd: v/h/k + dau) -> BO QUA dau, giu nguyen chu.
+
 GHI CHU KY THUAT:
     Dau duoc bieu dien bang "ky tu to hop" (combining marks) cua Unicode.
     Sau khi ghep, ta goi normalize("NFC") de bien 'a' + dau-trang thanh 1
@@ -32,26 +40,58 @@ TONE = {
 
 # Dau bien doi chu -> ky tu to hop
 MODIFIER = {
-    "dau_mu":    "\u0302",  # ^      (a o e -> â ô ê)
+    "dau_mu":    "\u0302",  # ^      (a e o -> â ê ô)
     "dau_trang": "\u0306",  # breve  (a -> ă)
     "dau_rau":   "\u031b",  # horn   (o u -> ơ ư)
 }
 
+# QUY TAC HOP LE: moi dau bien doi chi di voi mot so nguyen am goc
+MODIFIER_VALID_BASE = {
+    "dau_mu":    set("aeo"),   # â ê ô
+    "dau_trang": set("a"),     # ă
+    "dau_rau":   set("ou"),    # ơ ư
+}
+
+# Nguyen am co the mang dau THANH (sac/huyen/hoi/nga/nang)
+VOWELS = set("aeiouy")
+
+
+def _base_letter(base):
+    """Tra ve ky tu goc (1 chu thuong) tu token, vd 'chu_a' -> 'a'. 'chu_dd' -> 'đ'."""
+    if base in ("chu_dd", "đ", "dd"):
+        return "đ"
+    if base.startswith("chu_"):
+        return base[len("chu_"):]
+    return base
+
 
 def compose_char(base, modifier=None, tone=None):
-    """Ghep 1 chu cai goc + (dau bien doi) + (dau thanh) -> ky tu NFC."""
-    # Xu ly 'd-dai' (đ) rieng (khong phai ghep tu d + dau)
-    if base in ("chu_dd", "đ", "dd"):
-        s = "đ"
-    elif base.startswith("chu_"):
-        s = base[len("chu_"):]  # 'chu_a' -> 'a'
-    else:
-        s = base
-    if modifier in MODIFIER:
-        s = s + MODIFIER[modifier]  # gan dau bien doi
-    if tone in TONE:
-        s = s + TONE[tone]          # gan dau thanh
+    """Ghep 1 chu cai goc + (dau bien doi) + (dau thanh) -> ky tu NFC.
+
+    CHI ghep khi hop le; neu khong hop le thi BO QUA dau (khong tao ky tu rac).
+    """
+    s = _base_letter(base)
+    letter = s  # giu lai chu goc de kiem tra nguyen am
+
+    # 1) Dau bien doi: chi ap dung khi chu goc nam trong tap hop hop le
+    if modifier in MODIFIER and letter in MODIFIER_VALID_BASE.get(modifier, set()):
+        s = s + MODIFIER[modifier]
+
+    # 2) Dau thanh: chi ap dung khi chu goc la NGUYEN AM (đ khong nhan thanh)
+    if tone in TONE and letter in VOWELS:
+        s = s + TONE[tone]
+
     return unicodedata.normalize("NFC", s)  # 'a' + dau-trang -> 'ă'
+
+
+def is_valid_modifier(base, modifier):
+    """True neu dau bien doi hop le voi chu goc (dung de loc tu/canh bao)."""
+    return _base_letter(base) in MODIFIER_VALID_BASE.get(modifier, set())
+
+
+def is_valid_tone(base):
+    """True neu chu goc co the mang dau thanh."""
+    return _base_letter(base) in VOWELS
 
 
 def tokens_to_text(tokens):
@@ -59,13 +99,12 @@ def tokens_to_text(tokens):
 
     Cach hoat dong (may trang thai):
       - Gap chu cai goc moi  -> "chot" chu dang dung truoc do, bat dau chu moi.
-      - Gap dau bien doi/dau thanh -> gan vao chu DANG dung.
+      - Gap dau bien doi/dau thanh -> gan vao chu DANG dung NEU hop le, nguoc lai BO QUA.
       - Gap 'space' -> chot chu + them khoang trang.
     """
     out, state = [], {"base": None, "modifier": None, "tone": None}
 
     def flush():
-        # Hoan tat chu dang dung (neu co) roi reset trang thai
         if state["base"] is not None:
             out.append(compose_char(state["base"], state["modifier"], state["tone"]))
         state["base"] = state["modifier"] = state["tone"] = None
@@ -75,9 +114,14 @@ def tokens_to_text(tokens):
             flush()
             out.append(" ")
         elif tok in MODIFIER:
-            state["modifier"] = tok
+            # chi nhan dau bien doi neu dang co chu goc va hop le
+            if state["base"] is not None and is_valid_modifier(state["base"], tok):
+                state["modifier"] = tok
+            # nguoc lai: bo qua (vd v/h/k + dau_mu)
         elif tok in TONE:
-            state["tone"] = tok
+            if state["base"] is not None and is_valid_tone(state["base"]):
+                state["tone"] = tok
+            # nguoc lai: bo qua dau thanh tren phu am
         else:  # chu cai goc
             flush()
             state["base"] = tok
@@ -91,8 +135,20 @@ if __name__ == "__main__":
         (["chu_a", "dau_mu", "thanh_sac"], "ấ"),
         (["chu_a", "dau_trang"], "ă"),
         (["chu_o", "dau_rau", "thanh_huyen"], "ờ"),
+        (["chu_u", "dau_rau", "thanh_hoi"], "ử"),
         (["chu_x", "chu_i", "space", "chu_n"], "xi n"),
+        # --- cac truong hop ghep KHONG hop le: phai BO QUA dau ---
+        (["chu_v", "dau_mu"], "v"),            # v khong nhan dau mu
+        (["chu_h", "thanh_sac"], "h"),         # phu am khong nhan thanh
+        (["chu_k", "dau_rau", "thanh_nga"], "k"),
+        (["chu_e", "dau_trang"], "e"),          # e khong co dau trang -> bo qua
+        (["chu_dd", "thanh_sac"], "đ"),         # đ khong nhan thanh
+        (["chu_o", "dau_mu", "thanh_nang"], "ộ"),
     ]
+    ok_all = True
     for toks, expect in tests:
         got = tokens_to_text(toks)
-        print(f"{toks} -> '{got}'  (mong doi '{expect}')  {'OK' if got==expect else 'SAI'}")
+        ok = (got == expect)
+        ok_all = ok_all and ok
+        print(f"{toks} -> '{got}'  (mong doi '{expect}')  {'OK' if ok else 'SAI'}")
+    print("=> TAT CA OK" if ok_all else "=> CO TEST SAI")
