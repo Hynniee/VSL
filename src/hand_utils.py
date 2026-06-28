@@ -1,7 +1,9 @@
 """
-hand_utils.py - utility dung chung cho extract/train/predict/app.
-Toan bo pipeline moi xoay quanh 2 ban tay (42 landmark), uu tien toc do va
-su on dinh cho bai toan CHU CAI TINH tu webcam.
+hand_utils.py - utility dùng chung cho extract/train/predict/app.
+Fixes vs bản cũ:
+  - preprocess_landmark_array KHÔNG gọi canonicalize_hands nữa (tránh double call)
+  - augment_hand_sequence thêm temporal_cutout (robust với frame drop từ webcam)
+  - _prepare trong dataset chịu trách nhiệm gọi canonicalize_hands 1 lần duy nhất
 """
 from __future__ import annotations
 
@@ -11,12 +13,12 @@ import numpy as np
 
 try:
     import cv2
-except Exception:  # cv2 co the vang trong vai moi truong
+except Exception:
     cv2 = None
 try:
     import mediapipe as mp
     mp_hands = mp.solutions.hands
-except Exception:  # mediapipe chua cai -> van import duoc cac hang so/ham numpy
+except Exception:
     mp = None
     mp_hands = None
 
@@ -27,7 +29,7 @@ HAND_EDGES = [
     (9, 13), (13, 14), (14, 15), (15, 16),
     (13, 17), (17, 18), (18, 19), (19, 20), (0, 17),
 ]
-# lien ket giua 2 tay de ST-GCN hoc tu the doi xung / khoang cach 2 tay
+# liên kết giữa 2 tay để ST-GCN học tư thế đối xứng / khoảng cách 2 tay
 CROSS_HAND_EDGES = [
     (0, 21), (5, 26), (9, 30), (13, 34), (17, 38),
     (4, 25), (8, 29), (12, 33), (16, 37), (20, 41),
@@ -66,10 +68,10 @@ def _canonicalize_one_hand(hand: np.ndarray) -> np.ndarray:
 
 
 def canonicalize_hands(arr: np.ndarray) -> np.ndarray:
-    """Chuan hoa 2 tay va dua sign 1 tay ve cung mot slot.
+    """Chuẩn hóa 2 tay và đưa sign 1 tay về cùng một slot.
 
-    - Neu chi co 1 tay: dua ve slot dau tien de giam phu thuoc trai/phai.
-    - Moi tay: tru co tay + chuan hoa theo kich thuoc tay.
+    - Nếu chỉ có 1 tay: đưa về slot đầu tiên để giảm phụ thuộc trái/phải.
+    - Mỗi tay: trừ cổ tay + chuẩn hóa theo kích thước tay.
     """
     if arr.ndim == 2:
         arr = arr[None, ...]
@@ -99,8 +101,12 @@ def _bone_vectors(one_hand: np.ndarray) -> np.ndarray:
 
 
 def extract_hand_features(seq42: np.ndarray, include_velocity: bool = True) -> np.ndarray:
-    """(T, 42, 3) -> (T, F) feature engineering nhe nhung hieu qua."""
-    seq = canonicalize_hands(seq42)
+    """(T, 42, 3) -> (T, F) feature engineering nhẹ nhưng hiệu quả.
+
+    NOTE: Hàm này KHÔNG gọi canonicalize_hands nữa.
+    Caller (dataset._prepare hoặc preprocess_landmark_array) phải gọi trước.
+    """
+    seq = seq42  # đã được canonicalize bởi caller
     coords = seq.reshape(seq.shape[0], -1)
 
     bones = []
@@ -129,27 +135,31 @@ def extract_hand_features(seq42: np.ndarray, include_velocity: bool = True) -> n
 
 
 def preprocess_landmark_array(arr: np.ndarray, feature_mode: str = "hands") -> np.ndarray:
-    """Ho tro ca dinh dang cu (T,543,3) lan moi (T,42,3).
+    """Hỗ trợ cả định dạng cũ (T,543,3) lẫn mới (T,42,3).
+
+    FIX: Không gọi canonicalize_hands nữa — caller phải gọi trước.
+    Điều này tránh double canonicalize khi gọi qua dataset._prepare.
 
     feature_mode:
-      - hands     : feature engineering phang, hop MLP/GRU/Transformer
-      - hands_raw : raw joints 42x3 da canonicalize -> flatten 126, hop ST-GCN
-      - all       : fallback reshape toan bo
+      - hands     : feature engineering phẳng, hợp MLP/GRU/Transformer
+      - hands_raw : raw joints 42x3 đã canonicalize -> flatten 126, hợp ST-GCN
+      - all       : fallback reshape toàn bộ
     """
     arr = np.asarray(arr)
     if arr.ndim == 2:
         return arr.astype(np.float32)
     if arr.ndim != 3:
-        raise ValueError(f"Mang landmark khong hop le: shape={arr.shape}")
+        raise ValueError(f"Mảng landmark không hợp lệ: shape={arr.shape}")
     if arr.shape[1] == 543:
         arr = arr[:, -42:, :]
     elif arr.shape[1] != 42 and feature_mode in ("hands", "hands_raw"):
-        raise ValueError(f"Khong nhan dang duoc so diem tay: {arr.shape}")
+        raise ValueError(f"Không nhận dạng được số điểm tay: {arr.shape}")
 
     if feature_mode == "hands":
+        # KHÔNG gọi canonicalize nữa — caller đã gọi rồi
         return extract_hand_features(arr)
     if feature_mode == "hands_raw":
-        arr = canonicalize_hands(arr)
+        # KHÔNG gọi canonicalize nữa — caller đã gọi rồi
         return arr.reshape(arr.shape[0], -1).astype(np.float32)
     return arr.reshape(arr.shape[0], -1).astype(np.float32)
 
@@ -164,7 +174,31 @@ def rotate_xy(seq42: np.ndarray, deg: float) -> np.ndarray:
     return out
 
 
+def _temporal_cutout(seq: np.ndarray, rng: np.random.RandomState,
+                     max_cut_ratio: float = 0.25) -> np.ndarray:
+    """Xóa ngẫu nhiên 1 đoạn liên tiếp tối đa max_cut_ratio*T frames.
+
+    Mô phỏng mất frame từ webcam / chuyển động nhanh.
+    Đoạn bị xóa được thay bằng frame lân cận (forward-fill).
+    """
+    T = seq.shape[0]
+    if T < 4:
+        return seq
+    cut_len = max(1, int(rng.uniform(0.1, max_cut_ratio) * T))
+    start = rng.randint(0, T - cut_len + 1)
+    out = seq.copy()
+    # forward fill từ frame trước đoạn cắt (hoặc frame sau nếu start=0)
+    fill = out[start - 1] if start > 0 else out[start + cut_len]
+    out[start:start + cut_len] = fill
+    return out
+
+
 def augment_hand_sequence(seq42: np.ndarray, rng: np.random.RandomState) -> np.ndarray:
+    """Augmentation hình học + temporal cutout cho chuỗi 42 hand joints.
+
+    Mới so với bản cũ:
+    - Thêm temporal cutout (prob=0.25) để model chịu được frame drop
+    """
     out = seq42.astype(np.float32).copy()
     if rng.rand() < 0.85:
         out = rotate_xy(out, rng.uniform(-12, 12))
@@ -173,8 +207,11 @@ def augment_hand_sequence(seq42: np.ndarray, rng: np.random.RandomState) -> np.n
     if rng.rand() < 0.85:
         out += rng.normal(0, 0.01, size=out.shape).astype(np.float32)
     if rng.rand() < 0.20:
-        # dao 2 slot tay de giam nhay trai/phai tren webcam mirror
+        # đảo 2 slot tay để giảm nhạy trái/phải trên webcam mirror
         out = np.concatenate([out[:, 21:], out[:, :21]], axis=1)
+    # NEW: temporal cutout — mô phỏng mất frame
+    if rng.rand() < 0.25:
+        out = _temporal_cutout(out, rng)
     return out
 
 
@@ -191,7 +228,7 @@ def draw_hand_landmarks(img, hand_landmarks, color=(255, 0, 255)) -> None:
         cv2.circle(img, pt, 5 if i == 0 else 3, color, -1)
 
 
-def draw_guide_box(img, text: str = "Dat tay vao khung") -> None:
+def draw_guide_box(img, text: str = "Đặt tay vào khung") -> None:
     h, w = img.shape[:2]
     bw, bh = int(w * 0.44), int(h * 0.58)
     x1, y1 = (w - bw) // 2, (h - bh) // 2

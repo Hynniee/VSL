@@ -25,9 +25,10 @@
   "dau_mu": 23,
   "dau_rau": 24,
   "dau_trang": 25,
-  "thanh_hoi": 26,
-  "thanh_huyen": 27,
-  "thanh_nang": 28,
-  "thanh_nga": 29,
-  "thanh_sac": 30
+  "space": 26,
+  "thanh_hoi": 27,
+  "thanh_huyen": 28,
+  "thanh_nang": 29,
+  "thanh_nga": 30,
+  "thanh_sac": 31
 }

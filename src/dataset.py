@@ -1,7 +1,15 @@
-"""dataset.py - pipeline du lieu moi cho VSL.
+"""dataset.py - pipeline dữ liệu VSL.
 
-- hands: feature engineering cho MLP/GRU/Transformer
-- hands_raw: raw joints da canonicalize cho ST-GCN
+Fixes vs bản cũ:
+  - _prepare KHÔNG gọi canonicalize_hands cho mode=hands nữa
+    (extract_hand_features không còn gọi nội bộ -> loại bỏ double call)
+  - Mixup collate_fn_mixup thêm vào để dùng khi train (alpha=0.2)
+  - collate_fn giữ nguyên cho compatibility
+
+Chi tiết:
+  - hands     : canonicalize_hands -> extract_hand_features (không canonicalize lần 2)
+  - hands_raw : canonicalize_hands -> flatten (không canonicalize lần 2)
+  - unified   : canonicalize_unified (không thay đổi)
 """
 from __future__ import annotations
 
@@ -57,16 +65,18 @@ class VSLDataset(Dataset):
             if arr.shape[1] == 543:
                 arr = arr[:, -42:, :]
             elif arr.shape[1] != 42:
-                raise ValueError(f"Shape landmark la: {arr.shape}")
+                raise ValueError(f"Shape landmark là: {arr.shape}")
+            # FIX: canonicalize_hands gọi 1 lần duy nhất ở đây
             arr = canonicalize_hands(arr)
             if self.train and self.augment:
                 arr = augment_hand_sequence(arr, self.rng)
+            # preprocess_landmark_array KHÔNG gọi canonicalize nữa (đã fix ở hand_utils)
             return preprocess_landmark_array(arr, feature_mode=self.feature_mode)
         return preprocess_landmark_array(arr, feature_mode=self.feature_mode)
 
     def _prepare_unified(self, arr):
         if arr.ndim != 3:
-            raise ValueError(f"Unified can mang 3 chieu, nhan {arr.shape}")
+            raise ValueError(f"Unified cần mảng 3 chiều, nhận {arr.shape}")
         if arr.shape[2] == 4:
             coords = arr[:, :, :3].astype(np.float32).copy()
             mask = arr[:, :, 3] > 0.5
@@ -78,7 +88,7 @@ class VSLDataset(Dataset):
         elif arr.shape[1] == 543 and arr.shape[2] == 3:
             coords, mask = embed_hands_only(arr[:, -42:, :])
         else:
-            raise ValueError(f"Layout unified khong ho tro: {arr.shape}")
+            raise ValueError(f"Layout unified không hỗ trợ: {arr.shape}")
         coords = canonicalize_unified(coords, mask)
         if self.train and self.augment:
             coords, mask = augment_unified_sequence(coords, mask, self.rng)
@@ -112,3 +122,35 @@ def collate_fn(batch):
     for i, seq in enumerate(seqs):
         padded[i, :seq.shape[0]] = seq
     return padded, torch.tensor(lengths, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
+
+
+def collate_fn_mixup(batch, alpha: float = 0.2, num_classes: int = None):
+    """Collate với Mixup trên chuỗi.
+
+    Trộn cặp ngẫu nhiên trong batch: x = lam*x_i + (1-lam)*x_j
+    Label trả về dạng (y_i, y_j, lam) để tính loss trong train loop.
+
+    Dùng khi train với --mixup. Không dùng khi eval.
+    """
+    seqs, lengths, labels = zip(*batch)
+    feat = int(seqs[0].shape[1])
+    max_len = max(int(s.shape[0]) for s in seqs)
+    B = len(seqs)
+
+    padded = torch.zeros(B, max_len, feat, dtype=torch.float32)
+    for i, seq in enumerate(seqs):
+        padded[i, :seq.shape[0]] = seq
+    lengths_t = torch.tensor(lengths, dtype=torch.long)
+    labels_t = torch.tensor(labels, dtype=torch.long)
+
+    if alpha > 0:
+        lam = float(np.random.beta(alpha, alpha))
+        lam = max(lam, 1 - lam)  # lam >= 0.5 để giữ label chính
+        perm = torch.randperm(B)
+        padded = lam * padded + (1 - lam) * padded[perm]
+        lengths_t2 = lengths_t[perm]
+        labels_t2 = labels_t[perm]
+        # lengths lấy max của cặp để không mất info
+        lengths_mix = torch.maximum(lengths_t, lengths_t2)
+        return padded, lengths_mix, (labels_t, labels_t2, lam)
+    return padded, lengths_t, (labels_t, labels_t, 1.0)

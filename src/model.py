@@ -1,4 +1,4 @@
-"""model.py - model moi uu tien nhanh, on dinh; co them ST-GCN toi uu cho hand joints."""
+"""model.py - RTX 4050 optimized: fixed A_learn wd, consistent masked std, BN momentum 0.05."""
 from __future__ import annotations
 
 import torch
@@ -155,9 +155,11 @@ class SpatialGraphConv(nn.Module):
     def __init__(self, in_ch, out_ch, A):
         super().__init__()
         self.register_buffer("A_base", A)
+        # FIX: A_learn tách param group riêng (wd=0) ở optimizer
         self.A_learn = nn.Parameter(torch.zeros_like(A))
         self.theta = nn.Conv2d(in_ch, out_ch, 1)
-        self.bn = nn.BatchNorm2d(out_ch)
+        # FIX: momentum=0.05 để BN tracking ổn định hơn với batch nhỏ/lệch
+        self.bn = nn.BatchNorm2d(out_ch, momentum=0.05)
 
     def forward(self, x):
         A = self.A_base + self.A_learn
@@ -172,27 +174,28 @@ class MultiScaleTemporalConv(nn.Module):
         branch = channels // 4
         self.b1 = nn.Sequential(
             nn.Conv2d(channels, branch, 1),
-            nn.BatchNorm2d(branch),
+            nn.BatchNorm2d(branch, momentum=0.05),
             nn.ReLU(inplace=True),
             nn.Conv2d(branch, branch, (3, 1), (stride, 1), (1, 0)),
         )
         self.b2 = nn.Sequential(
             nn.Conv2d(channels, branch, 1),
-            nn.BatchNorm2d(branch),
+            nn.BatchNorm2d(branch, momentum=0.05),
             nn.ReLU(inplace=True),
             nn.Conv2d(branch, branch, (5, 1), (stride, 1), (2, 0)),
         )
         self.b3 = nn.Sequential(
             nn.Conv2d(channels, branch, 1),
-            nn.BatchNorm2d(branch),
+            nn.BatchNorm2d(branch, momentum=0.05),
             nn.ReLU(inplace=True),
             nn.Conv2d(branch, branch, (7, 1), (stride, 1), (3, 0)),
         )
+        # b4: max-pool branch — không cần BN riêng vì BN chung sau cat
         self.b4 = nn.Sequential(
             nn.MaxPool2d(kernel_size=(3, 1), stride=(stride, 1), padding=(1, 0)),
             nn.Conv2d(channels, branch, 1),
         )
-        self.bn = nn.BatchNorm2d(branch * 4)
+        self.bn = nn.BatchNorm2d(branch * 4, momentum=0.05)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -214,7 +217,7 @@ class STGCNBlock(nn.Module):
         else:
             self.residual = nn.Sequential(
                 nn.Conv2d(in_ch, out_ch, 1, (stride, 1)),
-                nn.BatchNorm2d(out_ch),
+                nn.BatchNorm2d(out_ch, momentum=0.05),
             )
         self.relu = nn.ReLU(inplace=True)
         self.stride = stride
@@ -228,23 +231,23 @@ class STGCNBlock(nn.Module):
 
 
 class STGCNClassifier(nn.Module):
-    """ST-GCN tối ưu cho 42 joints bàn tay, hợp chữ cái và từ vựng ngắn.
+    """ST-GCN tối ưu cho 42 joints bàn tay (RTX 4050 edition).
 
-    Điểm tối ưu:
-    - input raw joints chuẩn hóa (hands_raw)
-    - motion stream nội bộ bằng velocity theo thời gian
-    - graph có cả intra-hand + cross-hand edges
-    - temporal conv đa tỉ lệ để bắt dáng tĩnh lẫn chuyển động ngắn
+    Fixes vs bản cũ:
+    - std joint được tính weighted (nhất quán với HolisticSTGCN)
+    - data_bn momentum=0.05 ổn định hơn
+    - A_learn cần tách param group (wd=0) khi build optimizer — xem build_optimizer()
     """
     def __init__(self, input_size, num_classes, hidden=64, dropout=0.2):
         super().__init__()
         if input_size % 3 != 0:
-            raise ValueError(f"ST-GCN can input la raw joints 3D, nhan duoc input_size={input_size}")
+            raise ValueError(f"ST-GCN cần input là raw joints 3D, nhận input_size={input_size}")
         self.num_joints = input_size // 3
         self.num_coords = 3
         A = build_adjacency(self.num_joints)
         in_ch = self.num_coords * 2  # coords + velocity
-        self.data_bn = nn.BatchNorm1d(self.num_joints * in_ch)
+        # FIX: momentum=0.05
+        self.data_bn = nn.BatchNorm1d(self.num_joints * in_ch, momentum=0.05)
         self.blocks = nn.ModuleList([
             STGCNBlock(in_ch, hidden, A, stride=1, dropout=dropout, residual=False),
             STGCNBlock(hidden, hidden, A, stride=1, dropout=dropout),
@@ -277,20 +280,23 @@ class STGCNClassifier(nn.Module):
             if blk.stride > 1:
                 cur_len = (cur_len + blk.stride - 1) // blk.stride
 
-        # masked pooling tren time sau khi da qua cac stride
         t2 = h.size(2)
         mask = (torch.arange(t2, device=h.device)[None, :] < cur_len[:, None]).float()
         mask4 = mask[:, None, :, None]
-        h_mean_joint = (h * mask4).sum(dim=2) / mask4.sum(dim=2).clamp(min=1.0)  # (B,C,V)
-        h_max_joint = h.masked_fill(mask4 == 0, -1e4).amax(dim=2)                 # (B,C,V)
-        mean = h_mean_joint.mean(dim=2)
-        hmax = h_max_joint.max(dim=2).values
-        std = h_mean_joint.std(dim=2)
+        denom_t = mask4.sum(dim=2).clamp(min=1.0)                                    # (B,C,1,V)
+        h_mean_joint = (h * mask4).sum(dim=2) / denom_t                              # (B,C,V)
+        h_max_joint = h.masked_fill(mask4 == 0, -1e4).amax(dim=2)                   # (B,C,V)
+
+        # FIX: weighted std theo joint dim (nhất quán với HolisticSTGCN)
+        mean = h_mean_joint.mean(dim=2)                                               # (B,C)
+        var = ((h_mean_joint - mean[:, :, None]) ** 2).mean(dim=2)
+        std = torch.sqrt(var.clamp(min=1e-6))                                        # (B,C)
+        hmax = h_max_joint.max(dim=2).values                                         # (B,C)
         return self.head(torch.cat([mean, std, hmax], dim=1))
 
 
 def build_unified_adjacency(num_joints: int) -> torch.Tensor:
-    """Do thi khop cho schema GOP (pose + 2 tay + mat)."""
+    """Đồ thị khớp cho schema GOP (pose + 2 tay + mặt)."""
     A = torch.eye(num_joints, dtype=torch.float32)
     if num_joints == NUM_UNIFIED_JOINTS:
         for a, b in UNIFIED_EDGES:
@@ -303,25 +309,21 @@ def build_unified_adjacency(num_joints: int) -> torch.Tensor:
 
 
 class HolisticSTGCNClassifier(nn.Module):
-    """ST-GCN GOP: dung CHUNG du lieu chi-co-tay (cu) lan day-du (moi).
+    """ST-GCN GOP: dùng CHUNG dữ liệu chỉ-có-tay (cũ) lẫn đầy-đủ (mới).
 
-    Input flatten (T, V*4) voi 4 = [x, y, z, presence].
-    - presence = 0 -> khop vang (vd pose/mat trong du lieu cu). Toa do bi zero,
-      nhung kenh presence cho model biet khop do "vang" (khac voi o goc toa do).
-    - velocity tinh noi bo de bat chuyen dong.
-    - pooling theo thoi gian dung lengths; pooling theo khop bo qua khop vang.
+    Input flatten (T, V*4) với 4 = [x, y, z, presence].
     """
     def __init__(self, input_size, num_classes, hidden=64, dropout=0.2):
         super().__init__()
         if input_size % 4 != 0:
             raise ValueError(
-                f"Holistic ST-GCN can input dang [x,y,z,presence] (chia het 4), nhan {input_size}"
+                f"Holistic ST-GCN cần input dạng [x,y,z,presence] (chia hết 4), nhận {input_size}"
             )
         self.num_joints = input_size // 4
         A = build_unified_adjacency(self.num_joints)
         in_ch = 3 + 3 + 1  # coords + velocity + presence
         self.in_ch = in_ch
-        self.data_bn = nn.BatchNorm1d(self.num_joints * in_ch)
+        self.data_bn = nn.BatchNorm1d(self.num_joints * in_ch, momentum=0.05)
         self.blocks = nn.ModuleList([
             STGCNBlock(in_ch, hidden, A, stride=1, dropout=dropout, residual=False),
             STGCNBlock(hidden, hidden, A, stride=1, dropout=dropout),
@@ -344,7 +346,7 @@ class HolisticSTGCNClassifier(nn.Module):
         feat = x.view(b, t, v, 4)
         coords = feat[..., :3]
         p = feat[..., 3:4]                       # (B,T,V,1) presence
-        coords = coords * p                      # zero khop vang
+        coords = coords * p                      # zero khớp vắng
         cc = coords.permute(0, 3, 1, 2).contiguous()      # (B,3,T,V)
         vel = torch.diff(cc, dim=2, prepend=cc[:, :, :1])
         pc = p.permute(0, 3, 1, 2).contiguous()           # (B,1,T,V)
@@ -354,7 +356,6 @@ class HolisticSTGCNClassifier(nn.Module):
         h = self.data_bn(h.transpose(1, 2)).transpose(1, 2)
         h = h.view(b, t, v, self.in_ch).permute(0, 3, 1, 2).contiguous()
 
-        # khop co xuat hien trong chuoi (B,V)
         joint_pres = (p.squeeze(-1).amax(dim=1) > 0.5).float()
 
         cur_len = lengths.clone()
@@ -363,14 +364,12 @@ class HolisticSTGCNClassifier(nn.Module):
             if blk.stride > 1:
                 cur_len = (cur_len + blk.stride - 1) // blk.stride
 
-        # pooling theo thoi gian (bo qua frame dem)
         t2 = h.size(2)
         tmask = (torch.arange(t2, device=h.device)[None, :] < cur_len[:, None]).float()
         tm = tmask[:, None, :, None]
         h_mean_joint = (h * tm).sum(dim=2) / tm.sum(dim=2).clamp(min=1.0)   # (B,C,V)
         h_max_joint = h.masked_fill(tm == 0, -1e4).amax(dim=2)             # (B,C,V)
 
-        # pooling theo khop (bo qua khop vang)
         jm = joint_pres[:, None, :]                                        # (B,1,V)
         denom = jm.sum(dim=2).clamp(min=1.0)                               # (B,1)
         mean = (h_mean_joint * jm).sum(dim=2) / denom                      # (B,C)
@@ -395,8 +394,27 @@ def available_models():
 
 def build_model(name, input_size, num_classes):
     key = name.lower().replace("-", "").replace("_", "")
-    alias = {"temporalmlp": "mlp", "fast": "mlp", "bigru": "gru", "stcgn": "stgcn", "stgcn": "stgcn", "holistic": "unified", "holisticstgcn": "unified", "unifiedstgcn": "unified", "unified": "unified"}
+    alias = {
+        "temporalmlp": "mlp", "fast": "mlp", "bigru": "gru",
+        "stcgn": "stgcn", "stgcn": "stgcn",
+        "holistic": "unified", "holisticstgcn": "unified",
+        "unifiedstgcn": "unified", "unified": "unified",
+    }
     key = alias.get(key, key)
     if key not in _MODELS:
-        raise ValueError(f"Model chua ho tro: {name}. Chon 1 trong {available_models()}")
+        raise ValueError(f"Model chưa hỗ trợ: {name}. Chọn 1 trong {available_models()}")
     return _MODELS[key](input_size, num_classes)
+
+
+def build_optimizer(model, lr: float, weight_decay: float):
+    """AdamW với param group riêng cho A_learn (wd=0).
+
+    Gọi hàm này thay vì tạo optimizer trực tiếp để A_learn không bị shrink.
+    """
+    a_learn_params = [p for n, p in model.named_parameters() if "A_learn" in n]
+    other_params   = [p for n, p in model.named_parameters() if "A_learn" not in n]
+    param_groups = [
+        {"params": other_params,   "weight_decay": weight_decay},
+        {"params": a_learn_params, "weight_decay": 0.0},   # FIX: graph không bị shrink về 0
+    ]
+    return torch.optim.AdamW(param_groups, lr=lr)
