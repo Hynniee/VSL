@@ -18,9 +18,10 @@ except Exception:
 try:
     import mediapipe as mp
     mp_hands = mp.solutions.hands
-except Exception:
-    mp = None
-    mp_hands = None
+except Exception as e:
+    import traceback
+    traceback.print_exc()
+    raise
 
 HAND_EDGES = [
     (0, 1), (1, 2), (2, 3), (3, 4),
