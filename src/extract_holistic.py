@@ -97,6 +97,8 @@ def main():
                     help="Tat lay mat (refine_face_landmarks=False, nhanh hon)")
     ap.add_argument("--max-frames", type=int, default=0,
                     help="0 = doc het video; >0 = cat den so frame nay")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="Bo qua file da co .npy trong processed (van giu metadata cu)")
     args = ap.parse_args()
 
     if mp_holistic is None:
@@ -120,6 +122,17 @@ def main():
 
     rows = []
     skipped = 0
+    kept_existing = 0
+
+    # Khi --skip-existing: nap metadata cu de giu lai dong cua cac file da trich.
+    old_meta = {}
+    if args.skip_existing and Path(args.metadata).exists():
+        try:
+            prev = pd.read_csv(args.metadata, encoding="utf-8-sig")
+            old_meta = {str(r["filename"]): r.to_dict() for _, r in prev.iterrows()}
+        except Exception:
+            old_meta = {}
+
     common = dict(
         static_image_mode=False,
         model_complexity=args.model_complexity,
@@ -139,6 +152,25 @@ def main():
             images = [p for p in files if p.suffix.lower() in IMAGE_EXTS]
 
             for vid in videos:
+                out_npy = proc / f"{vid.stem}.npy"
+                if args.skip_existing and out_npy.exists():
+                    kept_existing += 1
+                    if vid.name in old_meta:
+                        rows.append(old_meta[vid.name])
+                    else:
+                        try:
+                            nf = int(np.load(out_npy).shape[0])
+                        except Exception:
+                            nf = 0
+                        signer = parse_signer(vid.name)
+                        rows.append(dict(
+                            filename=vid.name, label=display, label_id=lid,
+                            modality="video", source="internet" if signer == "net" else "self",
+                            signer=signer, frames=nf, fps=0.0,
+                            date=date.today().isoformat(),
+                        ))
+                    print(f"[GIU][video] {vid.name}: da co .npy -> bo qua")
+                    continue
                 arr, fps, detected = extract_video(
                     vid, holistic_video, None if args.max_frames <= 0 else args.max_frames)
                 if arr is None:
@@ -159,6 +191,25 @@ def main():
                 print(f"[OK][video] {vid.name}: {arr.shape[0]} frame | co khop {detected}/{arr.shape[0]}")
 
             for imgp in images:
+                out_npy = proc / f"{imgp.stem}.npy"
+                if args.skip_existing and out_npy.exists():
+                    kept_existing += 1
+                    if imgp.name in old_meta:
+                        rows.append(old_meta[imgp.name])
+                    else:
+                        try:
+                            nf = int(np.load(out_npy).shape[0])
+                        except Exception:
+                            nf = 0
+                        signer = parse_signer(imgp.name)
+                        rows.append(dict(
+                            filename=imgp.name, label=display, label_id=lid,
+                            modality="image", source="internet" if signer == "net" else "self",
+                            signer=signer, frames=nf, fps=0.0,
+                            date=date.today().isoformat(),
+                        ))
+                    print(f"[GIU][anh] {imgp.name}: da co .npy -> bo qua")
+                    continue
                 arr, has = extract_image(imgp, holistic_image, args.image_frames)
                 if arr is None:
                     print(f"[LOI] Anh hong: {imgp}")
@@ -181,6 +232,8 @@ def main():
     print(f"\n[DONE] {len(rows)} mau (T,80,4) -> {args.processed} | {args.metadata} | {args.labels}")
     if skipped:
         print(f"[INFO] Da loai {skipped} mau khong thay khop")
+    if kept_existing:
+        print(f"[INFO] Da bo qua {kept_existing} mau da co .npy (--skip-existing)")
 
 
 if __name__ == "__main__":
